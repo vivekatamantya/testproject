@@ -46,7 +46,7 @@ static GObject *send_channel, *receive_channel;
 static SoupWebsocketConnection *ws_conn = NULL;
 static enum AppState app_state = 0;
 static const gchar *peer_id = NULL;
-static const gchar *server_url = "ws://3.130.16.226:9004";
+static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
 static gboolean disable_ssl = FALSE;
 static gboolean remote_is_offerer = FALSE;
 
@@ -298,7 +298,7 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
 
 #define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
 #define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
-#define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=H264,payload="
+#define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
 
 static void
 data_channel_on_error (GObject * dc, gpointer user_data)
@@ -380,10 +380,9 @@ start_pipeline (void)
   pipe1 =
       gst_parse_launch ("webrtcbin bundle-policy=max-bundle name=sendrecv "
       STUN_SERVER
-      "v4l2src device=/dev/video2 ! video/x-h264, format=h264, width=1920, height=1080, framerate=30/1 ! "
-      "h264parse ! rtph264pay mtu=1200 ! queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
-
-      "alsasrc device=hw:0,0 ! audioconvert ! audio/x-raw, format=S16LE, channels=2, rate=48000 ! opusenc ! rtpopuspay mtu=1200 ! "
+      "videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay ! "
+      "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
+      "audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay ! "
       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ", &error);
 
   if (error) {
@@ -800,10 +799,10 @@ main (int argc, char *argv[])
   if (!check_plugins ())
     return -1;
 
-  // if (!peer_id) {
-  //   g_printerr ("--peer-id is a required argument\n");
-  //   return -1;
-  // }
+  if (!peer_id) {
+    g_printerr ("--peer-id is a required argument\n");
+    return -1;
+  }
 
   /* Disable ssl when running a localhost server, because
    * it's probably a test server with a self-signed certificate */
