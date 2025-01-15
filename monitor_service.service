@@ -1,0 +1,13 @@
+[Unit]
+Description=5GCamera Monitor Service
+
+[Service]
+ExecStart=/bin/bash -c "/home/root/monitor_script.sh"
+#ExecStart=/bin/bash -c "/home/amantya/final_script/monitor_script.sh"
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=5GCamera
+
+[Install]
+WantedBy=default.target
+
