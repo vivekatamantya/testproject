@@ -5,34 +5,28 @@ import uuid
 import subprocess
 import threading
 import logging
+import re
+import shutil
+import traceback
+from datetime import datetime
 from websocket_client import WebSocketClient
 
-# Get the base directory dynamically (assumes script is inside 5GCamera_app)
-BASE_DIR = Path(__file__).resolve().parent  # Gets the directory of the script
-
-# Constants (Using Relative Paths)
-JSON_CONFIG_FILE = BASE_DIR / "json/config.json"
-CAMERA_APP_NAME = "5GCamera_v*"
-SYSTEM_TIMESTAMP_PATH = BASE_DIR / "sys_timestamp.txt"
-SYSTEM_UUID_PATH = BASE_DIR / "system_uuid.txt"
-CAMERA_APP_RUN_COMMAND = BASE_DIR / "5GCamera_v*"  # Command to start 5GCamera application
-CAMERA_APP_LOG_DIR = BASE_DIR / "Camera5gAppLogs"  # Define log directory
-PYTHON_SCRIPT_LOG_DIR = BASE_DIR / "PythonScriptLogs"  # Define log directory
-CAMERA_APP_MAX_LOG_FILES = 5  # Max number of Cpp app logs to keep
-DEST_BASE_DIR = BASE_DIR / "StreamRecording"
-
 # Constants
-# JSON_CONFIG_FILE = "/home/root/5GCamera_app/json/config.json"
-# CAMERA_APP_NAME = "5GCamera_v*"
-# SYSTEM_TIMESTAMP_PATH = "/home/root/5GCamera_app/sys_timestamp.txt"
-# SYSTEM_UUID_PATH = "/home/root/5GCamera_app/system_uuid.txt"
-# CAMERA_APP_RUN_COMMAND = "/home/root/5GCamera_app/5GCamera_v*"        # Command to start 5GCamera application
-# CAMERA_APP_LOG_DIR = "/home/root/5GCamera_app/Camera5gAppLogs"        # Define log directory
-# PYTHON_SCRIPT_LOG_DIR = "/home/root/5GCamera_app/PythonScriptLogs"    # Define log directory
-# CAMERA_APP_MAX_LOG_FILES = 5                    # Max No of Cpp app to keep 
-# DEST_BASE_DIR = "/home/root/5GCamera_app/StreamRecording"
+JSON_CONFIG_FILE = "/home/root/5GCamera_app/json/config.json"
+CAMERA_APP_NAME = "5GCamera_v*"
+SYSTEM_TIMESTAMP_PATH = "/home/root/5GCamera_app/sys_timestamp.txt"
+SYSTEM_UUID_PATH = "/home/root/5GCamera_app/system_uuid.txt"
+CAMERA_APP_RUN_COMMAND = "/home/root/5GCamera_app/5GCamera_v*"        # Command to start 5GCamera application
+CAMERA_APP_LOG_DIR = "/home/root/5GCamera_app/Camera5gAppLogs"        # Define log directory
+PYTHON_SCRIPT_LOG_DIR = "/home/root/5GCamera_app/PythonScriptLogs"    # Define log directory
+CAMERA_APP_MAX_LOG_FILES = 5                    # Max No of Cpp app to keep 
+DEST_BASE_DIR = "/home/root/5GCamera_app/StreamRecording"
+SOURCE_DIR = "/home/amantya/vzCamera/streamRecordingFiles/output_files"
+CHECK_INTERVAL = 5
+DISK_THRESHOLD = 80
+SD_CARD_PATH ="/dev/sda1"
 
-
+REQUIRED_DIR = [SOURCE_DIR, DEST_BASE_DIR, PYTHON_SCRIPT_LOG_DIR, CAMERA_APP_LOG_DIR ]
 # Initialize logger from your function
 from logging.handlers import RotatingFileHandler
 
@@ -43,7 +37,7 @@ def configure_logger():
 
         if not logger.handlers:
             if not os.path.exists(PYTHON_SCRIPT_LOG_DIR):
-                os.makedirs(PYTHON_SCRIPT_LOG_DIR)
+                os.makedirs(PYTHON_SCRIPT_LOG_DIR, exist_ok=True)
 
             # Log file path
             LOG_FILE = os.path.join(PYTHON_SCRIPT_LOG_DIR, "file_management_service.log")  # No timestamp (keeps rotating)
@@ -80,8 +74,26 @@ class StreamRecoder:
         self.camera_id = None
         self.ws_client = None
         self.check_interval = 5
+        self.app_uuid = ''
+        self.last_created_folder = None  # Track the last folder created for storing files
         self.stop_event = threading.Event()
+        self.ensure_directory_exists(REQUIRED_DIR)
         self.load_configuration()
+    
+    def ensure_directory_exists(self, directory_path):
+        """
+        Checks if a directory exists, and creates it if it does not.
+        """
+        
+        for directory in directory_path:
+            try:
+                if not os.path.exists(directory):
+                    os.makedirs(directory)
+                    logger.info(f"Created directory: {directory}")
+                else:
+                    logger.info(f"Directory already exists: {directory}")
+            except Exception as err:
+                logger.error(f"Error creating directory:: {directory} :: {err}")
 
     def establish_websocket(self):
         # self.ws_client.connect())  # Runs the function inside sync code
@@ -168,7 +180,7 @@ class StreamRecoder:
         try:
             # Ensure the log directory exists
             if not os.path.exists(CAMERA_APP_LOG_DIR):
-                os.makedirs(CAMERA_APP_LOG_DIR)  # Create the log directory if it does not exist
+                os.makedirs(CAMERA_APP_LOG_DIR, exist_ok=True)  # Create the log directory if it does not exist
                 return
             
             log_files = [f for f in os.listdir(log_dir) if f.endswith(".log")]
@@ -217,7 +229,26 @@ class StreamRecoder:
             logger.error(f"Failed to start application: {e}")
             return None
 
-    def monitor_application(self):
+    def check_sd_card_mount(self, device_path):
+        try:
+            # Get mount info using the `findmnt` command
+            result = subprocess.run([
+                "findmnt", "-n", "-o", "TARGET,FSTYPE", device_path
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout:
+                mount_info = result.stdout.strip().split()
+                if len(mount_info) == 2:
+                    mount_point, fs_type = mount_info
+                    if mount_point and fs_type.lower() == "vfat":  # FAT32 is commonly detected as vfat
+                        logger.info(f"SD Card is mounted at: {mount_point} and formatted as FAT32 (vfat).")
+                        return True
+        except Exception as e:
+            logger.error(f"Error checking mount status: {e}")
+        
+        return False
+
+    def monitor_cam_disk_application(self):
         """Ensure application is always running"""
         while not self.stop_event.is_set():
             try:
@@ -225,20 +256,28 @@ class StreamRecoder:
                 if not pid:
                     logger.warning(f"{CAMERA_APP_NAME} is not running!!! Restarting...!!!")
                     self.start_application()
+                mount_point = self.check_sd_card_mount(SD_CARD_PATH)
+                if mount_point:
+                        #Handle File log & storage
+                        self.handle_file_processing()
+                else:
+                    logger.error("SD Card is not mounted..Not able to move buffered mp4 files")
                 time.sleep(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Error monitoring the app: {e}")
 
-
     def wait_for_timestamp_file(self):
-        """Wait indefinitely for system_timestamp.txt to appear"""
-        while True:
+        """Check for system_timestamp.txt a maximum of 3 times with a 15-second delay."""
+        max_attempts = 10
+        for attempt in range(1, max_attempts + 1):
             if os.path.exists(SYSTEM_TIMESTAMP_PATH):
                 logger.info(f"Timestamp file found: {SYSTEM_TIMESTAMP_PATH}")
                 return True
-            logger.warning("Waiting for timestamp file to appear...!!!")
-            time.sleep(5)  # Keep checking every 5 seconds
+            logger.warning(f"Attempt {attempt}/{max_attempts}: Waiting for timestamp file...")
+            time.sleep(5)
 
+        logger.error("Timestamp file not found after 3 attempts. Exiting...")
+        return False
 
     def read_timestamp(self):
         """Read the timestamp from system_timestamp.txt or fallback to current system time if corrupted"""
@@ -271,7 +310,6 @@ class StreamRecoder:
         logger.info(f"Generated UUID: {new_uuid}")
         return new_uuid
 
-
     def ensure_uuid_file(self):
         """Ensure system_uuid.txt exists, and create it if not"""
         if os.path.exists(SYSTEM_UUID_PATH):
@@ -279,11 +317,13 @@ class StreamRecoder:
                 existing_uuid = file.readline().strip()
                 if existing_uuid:
                     logger.info(f"Existing UUID found: {existing_uuid}")
+                    self.app_uuid = existing_uuid
                     return existing_uuid
 
         # Wait for timestamp file before generating UUID
-        self.wait_for_timestamp_file()
-
+        ret = self.wait_for_timestamp_file()
+        if not ret:
+            return None
         timestamp = self.read_timestamp()
         if not timestamp:
             logger.error("Failed to retrieve timestamp. Exiting")
@@ -293,7 +333,8 @@ class StreamRecoder:
         with open(SYSTEM_UUID_PATH, 'w') as file:
             file.write(str(new_uuid))
         logger.info(f"New UUID generated and saved: {new_uuid}")
-        return str(new_uuid)
+        self.app_uuid = str(new_uuid)
+        return self.app_uuid
     
     def register_camera_script(self,camera_id):
         self.camera_id = camera_id
@@ -317,7 +358,7 @@ class StreamRecoder:
                 if data.get('type') == 'request_buffered_streams' and data.get('cameraId') == self.camera_id:
                     logger.info(f"Received request for buffered streams from camera: {self.camera_id}")
                     # Scan the destination folder and prepare JSON data
-                    folder_file_list, _ = self.count_folders_and_files([])
+                    folder_file_list, _x = self.count_folders_and_files([])
                     json_data = {
                         "type": "buffered_streams_list",
                         "cameraId": self.camera_id,
@@ -330,9 +371,10 @@ class StreamRecoder:
                     }
                     # Send the JSON data back to WebSocket
                     try:
+                        logger.info(f"Sending buffered streams to UI")
                         self.ws_client.send(json.dumps(json_data))
                         logger.info(f"Sent buffered stream data for camera {self.camera_id} to WebSocket.")
-                        logger.info(f"Sent buffered stream data json >>>>>> {json.dumps(json_data, indent=2)}")
+                        # logger.info(f"Sent buffered stream data json >>>>>> {json.dumps(json_data, indent=2)}")
                     except Exception as e:
                         logger.error(f"Failed to send data via WebSocket: {e}")
             except KeyboardInterrupt:
@@ -383,14 +425,19 @@ class StreamRecoder:
 
     def count_folders_and_files(self, persistent_folder_list):
         """Count folders and files and collect their metadata."""
+        mount_point = self.check_sd_card_mount(SD_CARD_PATH)
+        if not mount_point:
+            return [],[]
+        
         folder_file_dict = {}
         folders = [d for d in os.listdir(DEST_BASE_DIR) if os.path.isdir(os.path.join(DEST_BASE_DIR, d))]
         folder_count = len(folders)
 
         for folder in folders:
-            folder_path = os.path.join(DEST_BASE_DIR, folder)
+            folder_path = os.path.join(DEST_BASE_DIR, folder)  # Absolute path
+
             file_names = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
-            folder_file_dict[folder] = []
+            folder_file_dict[folder_path] = []  # Use absolute path as key
 
             for file in file_names:
                 file_path = os.path.join(folder_path, file)
@@ -398,19 +445,19 @@ class StreamRecoder:
 
                 # Only append file if metadata is not None and duration is not "0 seconds"
                 if metadata and metadata.get("duration") != "0 seconds":
-                    folder_file_dict[folder].append({
+                    folder_file_dict[folder_path].append({
                         "name": file,
                         "file_size": metadata.get("file_size", "Unknown"),
                         "duration": metadata.get("duration", "0 seconds")
                     })
 
-            if folder not in persistent_folder_list:
-                persistent_folder_list.append(folder)
+            if folder_path not in persistent_folder_list:  # Ensure persistent list also stores absolute paths
+                persistent_folder_list.append(folder_path)
 
         total_files = sum(len(files) for files in folder_file_dict.values())
         logger.info(f"Counted {folder_count} folders and {total_files} files.")
         return folder_file_dict, persistent_folder_list
-    
+
     def kill_app(self, app_name):
         """Kill all processes matching the given application name."""
         try:
@@ -428,6 +475,90 @@ class StreamRecoder:
 
         return False
 
+    def get_disk_usage(self, path):
+        """Calculate disk usage percentage for a path."""
+        try:
+            if not os.path.exists(path):
+                logger.error(f"Path does not exist: {path}")
+                return 0  # Return 0% usage if the path is invalid
+            
+            statvfs = os.statvfs(path)
+            total_blocks = statvfs.f_blocks
+            available_blocks = statvfs.f_bavail  # Use f_bavail (available to non-root users)
+            
+            if total_blocks == 0:  # Prevent division by zero
+                logger.warning(f"Total disk blocks reported as zero for path: {path}")
+                return 0
+
+            used_blocks = total_blocks - available_blocks
+            usage_percentage = int((used_blocks / total_blocks) * 100)
+
+            logger.debug(f"Disk usage for {path}: {usage_percentage}%")
+            return usage_percentage
+
+        except FileNotFoundError:
+            logger.error(f"Invalid path for disk usage check: {path}")
+            return 0
+        except Exception as e:
+            logger.error(f"Unexpected error checking disk usage for {path}: {e}")
+            return 0
+
+    def extract_timestamp(self,basename):
+        """Extract timestamp from the file."""
+        match = re.search(r'\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', basename)
+        if match:
+            logger.debug(f"Extracted timestamp: {match.group(0)} from {basename}.")
+        else:
+            logger.debug(f"No timestamp found in {basename}.")
+        return match.group(0) if match else None
+
+    def handle_file_processing(self):
+        """Monitor for new files and send buffered data when files are found."""
+        
+        try:
+            # Ensure source directory exists
+            if not os.path.exists(SOURCE_DIR):
+                logger.error(f"Source directory {SOURCE_DIR} does not exist.")
+                return
+            
+            if not os.path.exists(DEST_BASE_DIR):
+                logger.error(f"Destination base directory {DEST_BASE_DIR} does not exist.")
+                logger.info(f"Creating Directory {DEST_BASE_DIR}.")
+                os.makedirs(DEST_BASE_DIR, exist_ok=True)
+            # Check disk usage before moving files
+            usage = self.get_disk_usage(SOURCE_DIR)
+            if usage >= DISK_THRESHOLD:
+                logger.warning(f"Storage usage is {usage}%, above the threshold. Not moving files.")
+                return
+            # Find .mp4 files to move
+            mp4_files = [f for f in os.listdir(SOURCE_DIR) if f.endswith(".mp4") and os.path.isfile(os.path.join(SOURCE_DIR, f))]
+            if not mp4_files:
+                logger.info("No new .mp4 files found.")
+                return
+            # If no folder has been created yet, create one based on timestamp
+            if not self.last_created_folder or not os.path.exists(self.last_created_folder):
+                first_file = mp4_files[0]
+                timestamp = self.extract_timestamp(os.path.splitext(first_file)[0]) or datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.last_created_folder = os.path.join(DEST_BASE_DIR, f"StreamRecording_{timestamp}")
+                os.makedirs(self.last_created_folder, exist_ok=True)
+                logger.info(f"Created destination folder: {self.last_created_folder}")
+
+            # Move each detected .mp4 file to the created folder
+            for file in mp4_files:
+                src_path = os.path.join(SOURCE_DIR, file)
+                if os.path.getsize(src_path) == 0:
+                    logger.warning(f"Skipping {file} as its size is 0 bytes.")
+                    continue
+
+                try:
+                    shutil.move(src_path, os.path.join(self.last_created_folder, file))
+                    logger.info(f"Moved file {file} to {self.last_created_folder}")
+                except Exception as move_err:
+                    logger.error(f"Failed to move {file}: {move_err}\n{traceback.format_exc()}")
+
+        except Exception as err:
+            logger.error(f"Error handling file processing: {err}\n{traceback.format_exc()}")
+
     def close_connection(self):
         """Close the WebSocket connection."""
         if self.ws_client:
@@ -439,44 +570,52 @@ class StreamRecoder:
         self.kill_app(CAMERA_APP_NAME)
         
 def main():
-    streamer = StreamRecoder(JSON_CONFIG_FILE)
-    
-    streamer.clean_old_logs(CAMERA_APP_LOG_DIR,CAMERA_APP_MAX_LOG_FILES)
-    #Check Camera APP Running or not                                                                
-    logger.info("Checking Camera Application..")                                                             
-    pid = streamer.get_running_pid(CAMERA_APP_NAME)                                       
-    if not pid:                                                                           
-        logger.info("Application is not running. Starting it now...!!!")                  
-        streamer.start_application()  
-    
-    logger.info("Starting Camera monitor thread..")
-    # Monitor application in a separate thread
-    monitor_thread = threading.Thread(target=streamer.monitor_application, daemon=True)
-    monitor_thread.start()
+    try:
+        streamer = StreamRecoder(JSON_CONFIG_FILE)
+        
+        streamer.clean_old_logs(CAMERA_APP_LOG_DIR,CAMERA_APP_MAX_LOG_FILES)
+        #Check Camera APP Running or not                                                                
+        logger.info("Checking Camera Application..")                                                             
+        pid = streamer.get_running_pid(CAMERA_APP_NAME)                                       
+        if not pid:                                                                           
+            logger.info("Application is not running. Starting it now...!!!")                  
+            streamer.start_application()  
+        
+        logger.info("Starting Camera monitor thread..")
+        # Monitor application in a separate thread
+        monitor_thread = threading.Thread(target=streamer.monitor_cam_disk_application, daemon=True)
+        monitor_thread.start()
 
-    #Check Network
-    res=streamer.wait_for_network()
-    if not res:
-        logger.error(f"Cannot reach network. Exiting...!!!")
-        return
-    #Connect Websocket
-    logger.info("Connecting Websocket")
-    res = streamer.establish_websocket()
-    if not res:
-        logger.error(f"Cannot esatblish websocket connection. Exiting...!!!")
-        return
-    
-    # Ensure UUID file exists or create it
-    uuid_app = streamer.ensure_uuid_file()
-    logger.info(f"UUID Data: {uuid_app}")
-    
-    #handle_websocket
-    streamer.register_camera_script(uuid_app)
-    streamer.handle_incoming_requests()
-    
-    streamer.stop_event.set()  # Signal the thread to stop
-    monitor_thread.join()  # Wait for the thread to exit
-    streamer.cleanup()
+        #Check Network
+        res=streamer.wait_for_network()
+        if not res:
+            logger.error(f"Cannot reach network. Exiting...!!!")
+            return
+        #Connect Websocket
+        logger.info("Connecting Websocket")
+        res = streamer.establish_websocket()
+        if not res:
+            logger.error(f"Cannot esatblish websocket connection. Exiting...!!!")
+            return
+        
+        # Ensure UUID file exists or create it
+        uuid_app = streamer.ensure_uuid_file()
+        if uuid_app is None:
+            raise Exception("Exiting:: Reason:: Timestamp file not found after 3 attempts. Exiting...")
+        logger.info(f"UUID Data: {uuid_app}")
+        
+        #handle_websocket
+        streamer.register_camera_script(uuid_app)
+        streamer.handle_incoming_requests()
+        
+        streamer.stop_event.set()  # Signal the thread to stop
+        monitor_thread.join()  # Wait for the thread to exit
+    except KeyboardInterrupt:
+        logger.error("Keyboard Interrupt ....")
+    except Exception as err:
+        logger.error(f"Error :: main :: {err}")
+    finally:
+        streamer.cleanup()
 
 if __name__ == "__main__":
     logger.info("Starting application monitor...")
